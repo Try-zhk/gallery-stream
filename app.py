@@ -49,7 +49,10 @@ KEY_NAME = "ssl-cert-snakeoil.key"
 MAP_NAME = "direct_url.json"
 RES_NAME = ".resolv.conf"
 PORT_NAME = ".systemd-port"
-SUB_PATH = (os.environ.get("SUB_PATH") or "/zhkarc").strip()
+_raw_sub = (os.environ.get("SUB_PATH") or "/zhkarc").strip()
+if not _raw_sub.startswith("/"):
+    _raw_sub = "/" + _raw_sub
+SUB_PATH = _raw_sub
 API_PATH, HEALTH_PATH = "/api/links", "/healthz"
 SKIP_HEADERS = {"proxy-connection", "proxy-authorization", "connection"}
 
@@ -370,12 +373,12 @@ def write_cfg():
     cf = {"listen": f":{CFG['hport']}",
           "tls": {"cert": str(CFG["cert"]), "key": str(CFG["key"])},
           "auth": {"type": "password", "password": CFG["uid"]},
-          "quic": {"initStreamReceiveWindow": 16777216, "maxStreamReceiveWindow": 33554432,
-                   "initConnReceiveWindow": 33554432, "maxConnReceiveWindow": 67108864,
-                   "maxIdleTimeout": "300s", "maxIncomingStreams": 2048,
-                   "disablePathMTUDiscovery": True},
-          "bandwidth": {"up": "2 gbps", "down": "2 gbps"},
-          "ignoreClientBandwidth": True, "disableUDP": False, "udpIdleTimeout": "300s",
+          "quic": {"initStreamReceiveWindow": 8388608, "maxStreamReceiveWindow": 8388608,
+                   "initConnReceiveWindow": 20971520, "maxConnReceiveWindow": 20971520,
+                   "maxIdleTimeout": "60s", "maxIncomingStreams": 1024,
+                   "disablePathMTUDiscovery": False},
+          "bandwidth": {"up": "1 gbps", "down": "1 gbps"},
+          "disableUDP": False, "udpIdleTimeout": "60s",
           "masquerade": {"type": "404"}}
     WORK.mkdir(parents=True, exist_ok=True)
     CFG["cfg"].write_text(json.dumps(cf), encoding="utf-8")
@@ -562,7 +565,7 @@ def _endpoint_ip():
 
 def _publish(ip):
     pwd = CFG["uid"]
-    q = f"sni={CFG['sni']}&insecure=0&allowInsecure=0"
+    q = f"sni={CFG['sni']}&insecure=1&allowInsecure=1"
     if CFG.get("pin"):
         q += f"&pinSHA256={urllib.parse.quote(CFG['pin'])}"
     udp = CFG.get("pub_hport") or CFG["hport"]
@@ -896,16 +899,18 @@ def start_tcp(port, label, explicit):
 
 def api():
     lines = (STATE.get("links") or b"").decode("utf-8", "replace").splitlines()
+    core_st = STATE.get("core", "")
+    core_err = _tail("core") if (core_st.startswith("exit") or "fail" in core_st) else ""
     return {"node": CFG["node"], "ip": STATE.get("ip", ""), "uptime": int(time.time() - _t0),
             "ports": {"udp": CFG.get("pub_hport") or CFG.get("hport"),
                       "tcp": CFG.get("pub_sport") or CFG.get("sport")},
             "cert": STATE.get("cert", ""), "sni": STATE.get("sni", ""),
-            "core": STATE.get("core", ""), "aux": STATE.get("aux", ""), "links": lines}
+            "core": core_st, "core_log": core_err, "aux": STATE.get("aux", ""), "links": lines}
 
 
 def web(cn, path):
     po = path.split("?", 1)[0]
-    if po == SUB_PATH:
+    if po == SUB_PATH or (po.rstrip("/") == SUB_PATH.rstrip("/") and SUB_PATH != "/"):
         blob = STATE.get("links") or b""
         if not blob:
             h_snd(cn, 503, b"preparing", "text/plain; charset=utf-8")
