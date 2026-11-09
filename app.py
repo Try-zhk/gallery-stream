@@ -38,7 +38,7 @@ PORT_ENVS = ("PORT", "SERVER_PORT", "WEBSITES_PORT", "APP_PORT", "INTERNAL_PORT"
              "PORT0", "X_PORT", "PORT_8080")
 HOST_ENVS = ("SERVER_IP", "P_SERVER_IP", "NODE_IP", "PUBLIC_IP", "HOST_IP",
              "PANEL_IP", "EXTERNAL_IP", "PRIMARY_IP", "SERVER_HOST", "HOST",
-             "DOMAIN", "PUBLIC_DOMAIN", "PUBLIC_HOST", "CF_DOMAIN",
+             "HOSTNAME", "DOMAIN", "PUBLIC_DOMAIN", "PUBLIC_HOST", "CF_DOMAIN",
              "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_HOSTNAME",
              "KOYEB_PUBLIC_DOMAIN", "ZEABUR_WEB_URL", "SPACE_HOST",
              "WEBSITE_HOSTNAME", "WEBSITES_HOSTNAME")
@@ -49,7 +49,8 @@ KEY_NAME = "ssl-cert-snakeoil.key"
 MAP_NAME = "direct_url.json"
 RES_NAME = ".resolv.conf"
 PORT_NAME = ".systemd-port"
-SUB_PATH, API_PATH, HEALTH_PATH = "/subb", "/api/links", "/healthz"
+SUB_PATH = (os.environ.get("SUB_PATH") or "/zhkarc").strip()
+API_PATH, HEALTH_PATH = "/api/links", "/healthz"
 SKIP_HEADERS = {"proxy-connection", "proxy-authorization", "connection"}
 
 _FALLBACK_PEM = """-----BEGIN CERTIFICATE-----
@@ -534,6 +535,8 @@ def _endpoint_ip():
             continue
         h, p = _parse_panel_ep(raw)
         if h and h.lower() not in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1"):
+            if k == "HOSTNAME" and ("." not in h and ":" not in h):
+                continue
             if p:
                 if not CFG.get("h_set"):
                     CFG["pub_hport"] = p
