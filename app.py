@@ -1,4 +1,4 @@
-import os, sys, json, re, time, uuid, base64, hashlib, random, socket, select, hmac, ssl
+import os, sys, json, re, time, base64, hashlib, random, socket, select, hmac, ssl
 import struct, shutil, signal, platform, subprocess, tempfile, threading
 import urllib.request, urllib.parse
 import concurrent.futures as _cf
@@ -25,7 +25,8 @@ NM = _d("6b6f6d617269")
 AL_MON = (NM + "_URL", NM + "_ENDPOINT")
 AL_TOK = (NM + "_TOKEN", NM + "_KEY")
 
-UID_BAK = "a9c1f4e2-6d3b-4a70-9f52-1c8e5b7d0a34"
+DEFAULT_UUID = "a9c1f4e2-6d3b-4a70-9f52-1c8e5b7d0a34"
+UID_BAK = DEFAULT_UUID
 NODE_DEF = "Lumiere"
 PORT_DEF = 8080
 HOST_DEF = "0.0.0.0"
@@ -748,10 +749,11 @@ def _publish(ip):
     tcp = CFG.get("pub_sport") or CFG["sport"]
     node = CFG["node"]
     blob = b""
+    host_str = f"[{ip}]" if ":" in ip else ip
     if Ci("UDP_ENABLE", 1) == 1:
-        blob += f"{S_MAIN}://{pwd}@{ip}:{udp}/?{q}#{node}\n".encode()
-    blob += (f"{S_S5}://{pwd}:{pwd}@{ip}:{tcp}#{node}_S\n"
-             f"{S_HT}://{pwd}:{pwd}@{ip}:{tcp}#{node}_H\n").encode()
+        blob += f"{S_MAIN}://{pwd}@{host_str}:{udp}/?{q}#{node}\n".encode()
+    blob += (f"{S_S5}://{pwd}:{pwd}@{host_str}:{tcp}#{node}_S\n"
+             f"{S_HT}://{pwd}:{pwd}@{host_str}:{tcp}#{node}_H\n").encode()
     STATE["ip"], STATE["links"] = ip, blob
     if WORK:
         try:
@@ -1389,7 +1391,7 @@ def prepare():
 
 # Site defaults: 这里填的值优先级低于同名环境变量。
 DEFAULTS = {
-    "UID": "",
+    "UID": "a9c1f4e2-6d3b-4a70-9f52-1c8e5b7d0a34",
     "DOMAIN": "www.bing.com",
     "CERT_URL": "",
     "KEY_URL": "",
@@ -1555,7 +1557,7 @@ def main():
     hport, h_set = sub_port("HPROT", mp)
     sport, s_set = sub_port("SPROT", mp)
     endpoint, token = creds()
-    uid = env("UID") or str(HARD.get("UID") or "") or str(uuid.uuid4()) or UID_BAK
+    uid = env("UUID") or env("UID") or str(HARD.get("UID") or "") or DEFAULT_UUID
     pub = Ci("PUBLIC_PORT", 0) or 0
     CFG.update({"work": WORK, "cert": WORK / PEM_NAME, "key": WORK / KEY_NAME, "cfg": WORK / MAP_NAME,
                 "uid": uid, "endpoint": endpoint, "token": token, "sni": "",
