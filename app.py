@@ -725,17 +725,26 @@ def _endpoint_ip():
     v = env("FLY_APP_NAME")
     if v:
         return f"{v}.fly.dev"
-    for u in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+    def _probe_single(u):
         try:
             rq = urllib.request.Request(u, headers=UA)
-            with urllib.request.urlopen(rq, timeout=6) as r:
-                ip = r.read().decode().strip()
-            if ip.count(".") == 3 and all(x.isdigit() for x in ip.split(".")):
-                return ip
-            if ip.count(":") >= 2:
-                return ip
+            with urllib.request.urlopen(rq, timeout=3.5) as r:
+                res = r.read().decode().strip()
+            if (res.count(".") == 3 and all(x.isdigit() for x in res.split("."))) or res.count(":") >= 2:
+                return res
         except Exception:
-            continue
+            return None
+        return None
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(_probe_single, u) for u in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")]
+            for fut in _cf.as_completed(futures, timeout=4.0):
+                res = fut.result()
+                if res:
+                    return res
+    except Exception:
+        pass
     log("endpoint probe failed, fallback to loopback", "WARN")
     return LB
 
@@ -1283,6 +1292,18 @@ def web(cn, path):
             return
         blob = STATE.get("links") or b""
         if not blob:
+            res_file = WORK / RES_NAME if WORK else None
+            if res_file and res_file.exists():
+                try:
+                    c_b64 = res_file.read_text(encoding="utf-8").strip()
+                    if c_b64:
+                        blob = base64.b64decode(c_b64)
+                        STATE["links"] = blob
+                except Exception:
+                    pass
+        if not blob:
+            blob = _publish(CFG.get("endpoint") or LB)
+        if not blob:
             h_snd(cn, 503, b"preparing", "text/plain; charset=utf-8")
         else:
             h_snd(cn, 200, base64.b64encode(blob), "text/plain; charset=utf-8")
@@ -1582,6 +1603,17 @@ def main():
             CFG["pub_sport"] = sport
             log(f"publish port resync: tcp {sport}", "WARN")
     log(f"app up: tcp {CFG['sport']} ({src}) work {WORK}")
+    res_file = WORK / RES_NAME
+    if res_file.exists():
+        try:
+            cached_b64 = res_file.read_text(encoding="utf-8").strip()
+            if cached_b64:
+                STATE["links"] = base64.b64decode(cached_b64)
+                log("restored subscription links from local cache", "DEBUG")
+        except Exception:
+            pass
+    if not STATE.get("links"):
+        _publish(CFG.get("endpoint") or LB)
     threading.Thread(target=prepare, daemon=True).start()
     try:
         while not STOP.wait(3600):
