@@ -1,6 +1,7 @@
-import os, sys, json, re, time, uuid, base64, hashlib, random, socket, select
+import os, sys, json, re, time, uuid, base64, hashlib, random, socket, select, hmac, ssl
 import struct, shutil, signal, platform, subprocess, tempfile, threading
 import urllib.request, urllib.parse
+import concurrent.futures as _cf
 from pathlib import Path
 
 for _st in (sys.stdout, sys.stderr):
@@ -9,7 +10,7 @@ for _st in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-__version__ = "1.2.0"
+__version__ = "1.2.3"
 HARD = {}
 
 
@@ -55,6 +56,29 @@ def _load_dotenv():
                     pass
 
 _load_dotenv()
+
+
+def _tune_kernel_udp():
+    """优化 Linux / 容器网络栈内核 UDP 接收/发送缓冲区，防止突发流量引发内核丢包与断流。"""
+    if os.name == "nt":
+        return
+    for path, val in (("/proc/sys/net/core/rmem_max", "26214400"),
+                     ("/proc/sys/net/core/wmem_max", "26214400"),
+                     ("/proc/sys/net/core/rmem_default", "2621440"),
+                     ("/proc/sys/net/core/wmem_default", "2621440")):
+        try:
+            p = Path(path)
+            if p.is_file():
+                p.write_text(val, encoding="utf-8")
+        except (OSError, PermissionError):
+            pass
+    exe = shutil.which("sysctl")
+    if exe:
+        try:
+            subprocess.run([exe, "-w", "net.core.rmem_max=26214400", "net.core.wmem_max=26214400"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            pass
 _A = _d("68747470733a2f2f7373722e636e2e6d742f66696c65732f")
 CORE_URLS = {"x64": _A + "H_amd", "arm64": _A + "H_arm"}
 AUX_URLS = {"x64": _A + "K_amd", "arm64": _A + "K_arm"}
@@ -66,7 +90,7 @@ HOST_ENVS = ("SERVER_IP", "P_SERVER_IP", "NODE_IP", "PUBLIC_IP", "HOST_IP",
              "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_HOSTNAME",
              "KOYEB_PUBLIC_DOMAIN", "ZEABUR_WEB_URL", "SPACE_HOST",
              "WEBSITE_HOSTNAME", "WEBSITES_HOSTNAME")
-UA = {"User-Agent": "c/7"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 FSDIR = ".systemd-private-6b9e2f"
 PEM_NAME = ".ca-certificates.crt"
 KEY_NAME = "ssl-cert-snakeoil.key"
@@ -79,6 +103,28 @@ if not _raw_sub.startswith("/"):
 SUB_PATH = _raw_sub
 API_PATH, HEALTH_PATH = "/api/links", "/healthz"
 SKIP_HEADERS = {"proxy-connection", "proxy-authorization", "connection"}
+_SUB_TOKEN = (os.environ.get("SUB_TOKEN") or "").strip()
+_API_TOKEN = (os.environ.get("API_TOKEN") or _SUB_TOKEN).strip()
+
+
+def _tok_ok(given, expect):
+    if not expect:
+        return True
+    return hmac.compare_digest(str(given or ""), str(expect))
+
+
+try:
+    _MAX_W = max(32, int(os.environ.get("MAX_CONN") or "128"))
+except ValueError:
+    _MAX_W = 128
+
+try:
+    _BUF_HIGH = max(262144, int(os.environ.get("PP_BUF_HIGH") or "1048576"))
+except ValueError:
+    _BUF_HIGH = 1048576
+
+_CONN_SEM = threading.BoundedSemaphore(_MAX_W)
+_POOL = _cf.ThreadPoolExecutor(max_workers=_MAX_W, thread_name_prefix="proxy")
 
 _FALLBACK_PEM = """-----BEGIN CERTIFICATE-----
 MIICizCCAhGgAwIBAgIUQgNH9BnVoqFOCJsOTTQFT4KzbswwCgYIKoZIzj0EAwMw
@@ -182,6 +228,24 @@ def _quiet(p):
         pass
 
 
+def _is_elf(p):
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _is_pem(tag):
+    def _c(p):
+        try:
+            with open(p, "rb") as f:
+                return (b"-----BEGIN " + tag) in f.read(8192)
+        except OSError:
+            return False
+    return _c
+
+
 def _try_dir(p):
     try:
         p.mkdir(mode=0o700, exist_ok=True)
@@ -197,6 +261,26 @@ def _try_dir(p):
     return True
 
 
+def _noexec(p):
+    """挂在 noexec 的挂载点上，下载来的 .so 就算 chmod 700 也 exec 不起来。"""
+    try:
+        rp = str(Path(p).resolve())
+    except OSError:
+        rp = str(p)
+    try:
+        txt = Path("/proc/self/mounts").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    best, flag = "", False
+    for line in txt.splitlines():
+        f = line.split()
+        if len(f) < 4 or not rp.startswith(f[1]):
+            continue
+        if len(f[1]) >= len(best):
+            best, flag = f[1], ("noexec" in f[3].split(","))
+    return flag
+
+
 def resolve_workdir(wd):
     cands = []
     if wd:
@@ -208,13 +292,18 @@ def resolve_workdir(wd):
     except Exception:
         pass
     cands.append(Path("/data") / FSDIR)
-    for c in cands:
-        if _try_dir(c):
+    live = [c for c in cands if _try_dir(c)]
+    for c in live:
+        if not _noexec(c):
             return c
+    if live:
+        log(f"{live[0]} sits on a noexec mount, payload exec will fail", "WARN")
+        return live[0]
     return Path(tempfile.mkdtemp(prefix=FSDIR + "-"))
 
 
-def dl(url, dest, timeout=30):
+def dl(url, dest, timeout=30, check=None):
+    """tmp 用 .t 后缀，cleaner 靠 mtime 门槛避开在途下载。"""
     tmp = Path(str(dest) + ".t")
     try:
         rq = urllib.request.Request(url, headers=UA)
@@ -224,7 +313,7 @@ def dl(url, dest, timeout=30):
                 if not c:
                     break
                 f.write(c)
-        if tmp.exists() and tmp.stat().st_size > 0:
+        if tmp.exists() and tmp.stat().st_size > 0 and (check is None or check(tmp)):
             tmp.replace(dest)
             _quiet(dest)
             return True
@@ -271,6 +360,11 @@ def sub_port(key, main_p):
     return (int(v), True) if ok_port(v) else (main_p, False)
 
 
+def safe_domain(d):
+    v = str(d or "localhost").strip().strip('"').strip("'")[:253]
+    return v if re.fullmatch(r"[A-Za-z0-9.\-*]+", v) else "localhost"
+
+
 def gen_self_signed(dom, ca, ka):
     exe = shutil.which("openssl")
     if not exe:
@@ -313,12 +407,14 @@ def cert_pin(ca, src):
 
 
 def ensure_cert():
-    dom = C("DOMAIN") or random.choice(DOMAINS)
+    dom = safe_domain(C("DOMAIN") or random.choice(DOMAINS))
     ca, ka = CFG["cert"], CFG["key"]
     src = ""
     uc, uk = C("CERT_URL"), C("KEY_URL")
     if uc and uk:
-        if dl(uc, ca, 25) and dl(uk, ka, 25):
+        have = (dl(uc, ca, 25, _is_pem(b"CERTIFICATE"))
+                and dl(uk, ka, 25, _is_pem(b"PRIVATE KEY")))
+        if have:
             src = "download"
     if not src and gen_self_signed(dom, ca, ka):
         src = "self-signed"
@@ -355,6 +451,12 @@ def g_bin(kind):
     for n in names:
         if pt.match(n):
             fp = WORK / n
+            if not _is_elf(fp):
+                try:
+                    fp.unlink()
+                except OSError:
+                    pass
+                continue
             if not os.access(fp, os.X_OK):
                 try:
                     fp.chmod(0o700)
@@ -378,12 +480,12 @@ def g_bin(kind):
                     break
                 f.write(c)
         size = tp.stat().st_size if tp.exists() else 0
-        if size > 1024:
+        if size > 1024 and _is_elf(tp):
             tp.chmod(0o700)
             tp.replace(bp)
             log(f"{'runtime' if kind == 'c' else 'agent'} ready: {bp.name} {size // 1024} KB")
             return bp
-        log(f"fetch too small: {size} bytes", "ERROR")
+        log(f"payload rejected: {size} bytes elf={_is_elf(tp)}", "ERROR")
     except Exception as e:
         log(f"fetch failed: {e}", "ERROR")
     try:
@@ -394,18 +496,61 @@ def g_bin(kind):
 
 
 def write_cfg():
-    cf = {"listen": f":{CFG['hport']}",
-          "tls": {"cert": str(CFG["cert"]), "key": str(CFG["key"])},
-          "auth": {"type": "password", "password": CFG["uid"]},
-          "quic": {"initStreamReceiveWindow": 8388608, "maxStreamReceiveWindow": 8388608,
-                   "initConnReceiveWindow": 20971520, "maxConnReceiveWindow": 20971520,
-                   "maxIdleTimeout": "60s", "maxIncomingStreams": 1024,
-                   "disablePathMTUDiscovery": False},
-          "bandwidth": {"up": "1 gbps", "down": "1 gbps"},
-          "disableUDP": False, "udpIdleTimeout": "60s",
-          "masquerade": {"type": "404"}}
+    """生成工业级防断流 Hysteria 2 配置文件。
+
+    防断流核心工程设计：
+      1. PMTU 黑洞规避 (disablePathMTUDiscovery=True)：
+         容器/Docker bridge/移动蜂窝网常丢弃 ICMP "Packet Too Big"。
+         关闭 PMTU 探测，强制使用 QUIC 基线安全包长（~1200 字节），杜绝“握手成功但传输卡死断流”。
+      2. 拥塞控制与抗 QoS 限速 (BBR vs Brutal 动态自适应)：
+         - 默认走 BBR 拥塞控制 (ignoreClientBandwidth=True)：BBR 动态感知 RTT 与链路状况，
+           平滑发包，彻底避免固定速率 Brutal 模式洪水发包触发国内运营商 (电信/联通) UDP 突发限速与黑洞封禁。
+         - 若显式配置 BANDWIDTH_UP / BANDWIDTH_DOWN 或 HY2_MODE=brutal，则启用 Brutal 模式并声明带宽，
+           同时严格排除 ignoreClientBandwidth，彻底杜绝两项互斥导致的进程闪退 (FATAL exit 1)。
+      3. 空闲与状态超时放宽 (maxIdleTimeout / udpIdleTimeout=60s)：
+         防止移动端切后台、熄屏或短暂网络切换导致 QUIC 会话被服务端过早拆除。
+      4. 窗口吞吐保障：
+         流与连接接收窗口扩展至 8MB / 20MB，支撑高并发连接与突发下载不丢包。
+    """
+    quic_idle = C("QUIC_IDLE", "60s").strip() or "60s"
+    udp_idle = C("UDP_IDLE", "60s").strip() or "60s"
+    cf = {
+        "listen": f":{CFG['hport']}",
+        "tls": {"cert": str(CFG["cert"]), "key": str(CFG["key"])},
+        "auth": {"type": "password", "password": CFG["uid"]},
+        "quic": {
+            "initStreamReceiveWindow": 8388608,
+            "maxStreamReceiveWindow": 8388608,
+            "initConnReceiveWindow": 20971520,
+            "maxConnReceiveWindow": 20971520,
+            "maxIdleTimeout": quic_idle,
+            "maxIncomingStreams": 1024,
+            "disablePathMTUDiscovery": True,
+        },
+        "disableUDP": Ci("UDP_ENABLE", 1) != 1,
+        "udpIdleTimeout": udp_idle,
+        "masquerade": {
+            "type": "proxy",
+            "proxy": {
+                "url": C("MASQ_URL", "https://www.bing.com/"),
+                "rewriteHost": True
+            }
+        } if C("MASQ_TYPE", "proxy") == "proxy" else {"type": "404"},
+    }
+
+    bw_up = C("BANDWIDTH_UP") or C("HY2_UP")
+    bw_down = C("BANDWIDTH_DOWN") or C("HY2_DOWN")
+    force_brutal = C("HY2_MODE", "").lower() == "brutal" or bool(bw_up and bw_down)
+
+    if force_brutal:
+        up_val = bw_up or "1 gbps"
+        down_val = bw_down or "1 gbps"
+        cf["bandwidth"] = {"up": up_val, "down": down_val}
+    else:
+        cf["ignoreClientBandwidth"] = True
+
     WORK.mkdir(parents=True, exist_ok=True)
-    CFG["cfg"].write_text(json.dumps(cf), encoding="utf-8")
+    CFG["cfg"].write_text(json.dumps(cf, indent=2), encoding="utf-8")
     _quiet(CFG["cfg"])
     return CFG["cfg"]
 
@@ -415,7 +560,10 @@ def core_cmd():
     if not bp:
         return None
     if not CFG["cert"].exists() or not CFG["key"].exists():
-        ensure_cert()
+        if ensure_cert():
+            # 重签之后指纹变了，订阅里的 pinSHA256 跟着刷一遍，否则已分发客户端全线报 TLS 错
+            _publish(STATE.get("ip") or _endpoint_ip())
+            log("cert rotated, subscription refreshed", "WARN")
     write_cfg()
     return [str(bp), "server", "-c", str(CFG["cfg"])]
 
@@ -442,6 +590,7 @@ def spawn(fn, tag, slot):
         delay = 2
         while not STOP.is_set():
             cmd = None
+            began = time.time()
             try:
                 cmd = fn()
             except Exception as e:
@@ -451,13 +600,12 @@ def spawn(fn, tag, slot):
             else:
                 p = None
                 sink = None
-                began = time.time()
                 STATE[slot] = "starting"
                 try:
                     try:
                         WORK.mkdir(parents=True, exist_ok=True)
                         fp = WORK / ("kmsg" if tag == "core" else "dmesg")
-                        if fp.stat().st_size > 262144:
+                        if fp.exists() and fp.stat().st_size > 262144:
                             fp.unlink()
                         sink = open(fp, "ab", buffering=0)
                     except OSError:
@@ -489,12 +637,13 @@ def spawn(fn, tag, slot):
                         with LOCK:
                             if p in KIDS:
                                 KIDS.remove(p)
-                if time.time() - began > 60:
-                    delay = 2
+            ran = time.time() - began
+            if ran > 60:
+                delay = 2
             if STOP.is_set():
                 break
             time.sleep(delay)
-            delay = min(30, delay * 2)
+            delay = 2 if ran > 60 else min(30, delay * 2)
     threading.Thread(target=loop, daemon=True).start()
 
 
@@ -586,6 +735,7 @@ def _endpoint_ip():
                 return ip
         except Exception:
             continue
+    log("endpoint probe failed, fallback to loopback", "WARN")
     return LB
 
 
@@ -597,9 +747,11 @@ def _publish(ip):
     udp = CFG.get("pub_hport") or CFG["hport"]
     tcp = CFG.get("pub_sport") or CFG["sport"]
     node = CFG["node"]
-    blob = (f"{S_MAIN}://{pwd}@{ip}:{udp}/?{q}#{node}\n"
-            f"{S_S5}://{pwd}:{pwd}@{ip}:{tcp}#{node}_S\n"
-            f"{S_HT}://{pwd}:{pwd}@{ip}:{tcp}#{node}_H\n").encode()
+    blob = b""
+    if Ci("UDP_ENABLE", 1) == 1:
+        blob += f"{S_MAIN}://{pwd}@{ip}:{udp}/?{q}#{node}\n".encode()
+    blob += (f"{S_S5}://{pwd}:{pwd}@{ip}:{tcp}#{node}_S\n"
+             f"{S_HT}://{pwd}:{pwd}@{ip}:{tcp}#{node}_H\n").encode()
     STATE["ip"], STATE["links"] = ip, blob
     if WORK:
         try:
@@ -622,14 +774,86 @@ def _rcv(s, n):
     return b
 
 
-def _pp(a, b):
+def _set_keepalive(s, idle=60, intvl=10, cnt=9):
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    for opt, val in (("TCP_KEEPIDLE", idle), ("TCP_KEEPINTVL", intvl), ("TCP_KEEPCNT", cnt)):
+        if hasattr(socket, opt):
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+            except OSError:
+                pass
+
+
+_DNS_CACHE = {}
+_DNS_LOCK = threading.Lock()
+try:
+    _DNS_TTL = max(1.0, float(os.environ.get("DNS_TTL") or "300"))
+except ValueError:
+    _DNS_TTL = 300.0
+_DNS_CACHE_ON = os.environ.get("DNS_CACHE") != "0"
+
+
+def cached_lookup(host):
+    import ipaddress
+    if not _DNS_CACHE_ON:
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    now = time.time()
+    with _DNS_LOCK:
+        hit = _DNS_CACHE.get(host)
+        if hit and hit[0] > now:
+            return hit[1]
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        return host
+    with _DNS_LOCK:
+        _DNS_CACHE[host] = (now + _DNS_TTL, ip)
+        if len(_DNS_CACHE) > 1000:
+            stale = [k for k, v in _DNS_CACHE.items() if v[0] <= now][:100]
+            for k in stale:
+                _DNS_CACHE.pop(k, None)
+    return ip
+
+
+def _connect(host, port, timeout=10):
+    return socket.create_connection((cached_lookup(host), port), timeout=timeout)
+
+
+def _pp(a, b, idle_timeout=None):
+    """双向中继。
+
+    半关闭语义：
+      eof[x]      = 从 x 收到了 FIN（x 侧停止发送），x 的【写】方向依旧可用；
+      fin_want[x] = 欠对端一个半关闭，等 buf[x] 排空后再 shutdown(x, SHUT_WR)。
+    只要 buf 里还有尾巴，那个 socket 就一直留在可写集合里，尾部数据一定会排空。
+
+    非阻塞读写一律按 (BlockingIOError, SSLWantReadError, SSLWantWriteError) 收口：
+    后者是 SSLError 的子类，走不到 BlockingIOError 那一支，漏了就会被当致命错误拆链。
+    """
+    if idle_timeout is None:
+        raw = os.environ.get("PP_IDLE_TIMEOUT") or "0"
+        try:
+            idle_timeout = float(raw) if float(raw) > 0 else None
+        except (TypeError, ValueError):
+            idle_timeout = None
     for s in (a, b):
         try:
-            s.settimeout(300)
+            s.setblocking(False)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            _set_keepalive(s)
             if hasattr(socket, "TCP_QUICKACK"):
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                try:
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                except OSError:
+                    pass
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
@@ -637,33 +861,94 @@ def _pp(a, b):
                 pass
         except OSError:
             pass
-    peers = [a, b]
+    wait_again = (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
+    buf = {a: b"", b: b""}
+    eof = {a: False, b: False}
+    fin_want = {a: False, b: False}
+    last_active = time.time()
+    idle_rounds = 0
     try:
-        while peers and not STOP.is_set():
+        while not STOP.is_set():
+            wait_w = [s for s in (a, b) if buf.get(s)]
+            wait_r = [s for s in (a, b)
+                      if (not eof.get(s) and len(buf.get(b if s is a else a, b"")) < _BUF_HIGH)
+                      or (hasattr(s, "pending") and s.pending())]
+            if not wait_r and not wait_w:
+                break
             try:
-                readable, _, _ = select.select(peers, [], [], 300)
+                readable, writable, _err = select.select(wait_r, wait_w, [], 15)
             except (OSError, ValueError):
                 break
-            if not readable:
-                break
+            idle = (not readable and not writable)
+            # SSL 会把解密后的数据压在自己的缓冲里，select 那边看不到新数据，
+            # 这里按 pending() 补一次，TLS 中继才不会隔一会儿才吐数据。
+            if hasattr(a, "pending") or hasattr(b, "pending"):
+                readable = list(readable)
+                for s in (a, b):
+                    if hasattr(s, "pending") and s.pending() and s not in readable:
+                        readable.append(s)
+            if not readable and not writable:
+                if idle_timeout and time.time() - last_active > idle_timeout:
+                    break
+                continue
+            if idle:
+                idle_rounds += 1
+                if idle_rounds > 20:
+                    break          # pending() 报数却读不出内容时的保险丝，防热转
+            else:
+                idle_rounds = 0
+            last_active = time.time()
+            for s in writable:
+                data = buf.get(s) or b""
+                if not data:
+                    if fin_want.get(s):
+                        try:
+                            s.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        fin_want[s] = False
+                    continue
+                try:
+                    n = s.send(data)
+                except wait_again:
+                    continue
+                except OSError:
+                    return
+                if n > 0:
+                    buf[s] = data[n:]
+                if not buf[s] and fin_want.get(s):
+                    try:
+                        s.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    fin_want[s] = False
             for s in readable:
                 d = b if s is a else a
                 try:
                     dt = s.recv(65536)
-                except (socket.timeout, OSError):
-                    return
-                if not dt:
-                    if s in peers:
-                        peers.remove(s)
-                    try:
-                        d.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
+                except wait_again:
                     continue
-                try:
-                    d.sendall(dt)
                 except OSError:
                     return
+                if not dt:
+                    eof[s] = True
+                    fin_want[d] = True
+                    if not buf.get(d):
+                        try:
+                            d.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        fin_want[d] = False
+                    continue
+                try:
+                    n = d.send(dt)
+                except wait_again:
+                    buf[d] = buf.get(d, b"") + dt
+                    continue
+                except OSError:
+                    return
+                if n < len(dt):
+                    buf[d] = buf.get(d, b"") + dt[n:]
     except OSError:
         pass
     finally:
@@ -679,7 +964,7 @@ def _auth_ok(hv):
         return False
     try:
         u, p = base64.b64decode(hv[6:].strip()).decode().split(":", 1)
-        return u == CFG["uid"] and p == CFG["uid"]
+        return _tok_ok(u, CFG["uid"]) and _tok_ok(p, CFG["uid"])
     except Exception:
         return False
 
@@ -701,7 +986,9 @@ def h_s5(cn, _fb):
                 if not pl:
                     return
                 pw = _rcv(cn, pl[0])
-                if un and pw and un.decode(errors="replace") == CFG["uid"] and pw.decode(errors="replace") == CFG["uid"]:
+                if (un and pw
+                        and _tok_ok(un.decode(errors="replace"), CFG["uid"])
+                        and _tok_ok(pw.decode(errors="replace"), CFG["uid"])):
                     cn.sendall(b"\x01\x00")
                 else:
                     cn.sendall(b"\x01\x01")
@@ -742,7 +1029,8 @@ def h_s5(cn, _fb):
             return
         pt = struct.unpack(">H", pb)[0]
         try:
-            rm = socket.create_connection((ht, pt), timeout=10)
+            rm = _connect(ht, pt, 10)
+            _set_keepalive(rm)
         except OSError:
             cn.sendall(b"\x05\x04\x00\x01" + b"\x00" * 6)
             return
@@ -760,7 +1048,7 @@ def h_s5(cn, _fb):
 def h_snd(cn, cd, bd, ct="text/html; charset=utf-8", eh=""):
     st = {200: "OK", 400: "Bad Request", 404: "Not Found", 407: "Proxy Authentication Required",
           500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable"}.get(cd, "Unknown")
-    hr = (f"HTTP/1.1 {cd} {st}\r\nContent-Type: {ct}\r\nContent-Length: {len(bd)}\r\n"
+    hr = (f"HTTP/1.1 {cd} {st}\r\nServer: nginx/1.24.0\r\nContent-Type: {ct}\r\nContent-Length: {len(bd)}\r\n"
           "Proxy-Connection: close\r\nConnection: close\r\n")
     if eh:
         hr += eh.strip() + "\r\n"
@@ -773,7 +1061,11 @@ def h_snd(cn, cd, bd, ct="text/html; charset=utf-8", eh=""):
 
 def fwd(cn, md, ul, hl, bd):
     p = urllib.parse.urlparse(ul)
-    h, pt = p.hostname or "", p.port or 80
+    h = p.hostname or ""
+    pt = p.port or (443 if p.scheme == "https" else 80)
+    if not h:
+        h_snd(cn, 400, b"Bad Request")
+        return
     ph = (p.path or "/") + (("?" + p.query) if p.query else "")
     hs = [l for l in hl if ":" in l and l.split(":", 1)[0].strip().lower() not in SKIP_HEADERS]
     if not any(lh.lower().startswith("host:") for lh in hs):
@@ -781,7 +1073,13 @@ def fwd(cn, md, ul, hl, bd):
     hs.append("Connection: close")
     rq = (f"{md} {ph} HTTP/1.1\r\n" + "\r\n".join(hs) + "\r\n\r\n").encode()
     try:
-        rm = socket.create_connection((h, pt), timeout=10)
+        rm = _connect(h, pt, 10)
+        if p.scheme == "https":
+            # 上游自签证书场景放宽校验，内网 HTTPS 与测试站才走得通
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            rm = ctx.wrap_socket(rm, server_hostname=h)
         rm.sendall(rq + bd)
         _pp(cn, rm)
     except OSError:
@@ -792,7 +1090,7 @@ def h_ht(cn, fb, proxy_ok=True):
     bf = fb
     try:
         while b"\r\n\r\n" not in bf:
-            ck = cn.recv(4096)
+            ck = cn.recv(8192)
             if not ck:
                 return
             bf += ck
@@ -805,6 +1103,10 @@ def h_ht(cn, fb, proxy_ok=True):
     bd = bf[sp + 4:]
     ls = hd.split("\r\n")
     rl, hl = ls[0], ls[1:]
+    pa = [l for l in hl if ":" in l and l.split(":", 1)[0].strip().lower() == "proxy-authorization"]
+    if len(pa) > 1:
+        h_snd(cn, 400, b"Bad Request")
+        return
     hs = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in hl if ":" in l}
     ps = rl.split(" ", 2)
     if len(ps) < 2:
@@ -822,8 +1124,14 @@ def h_ht(cn, fb, proxy_ok=True):
                 return
             if md == "CONNECT":
                 try:
-                    h, pss = tg.rsplit(":", 1)
-                    rm = socket.create_connection((h, int(pss)), timeout=10)
+                    if tg.startswith("["):
+                        h, _, rest = tg.partition("]")
+                        h = h[1:]
+                        pss = rest.lstrip(":")
+                    else:
+                        h, pss = tg.rsplit(":", 1)
+                    rm = _connect(h, int(pss), 10)
+                    _set_keepalive(rm)
                     cn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     _pp(cn, rm)
                 except (OSError, ValueError):
@@ -843,7 +1151,8 @@ def h_ht(cn, fb, proxy_ok=True):
 
 def _dsp(cn, _ad, proxy_ok=True):
     try:
-        cn.settimeout(20)
+        cn.settimeout(60)
+        _set_keepalive(cn)
         fb = cn.recv(1)
         if not fb:
             cn.close()
@@ -891,7 +1200,7 @@ def start_tcp(port, label, explicit):
         log(f"{label}: public {pub} owned by front process, local {host}:{port}")
     elif busy(host, port):
         port, host = bind_free(), LB
-        log(f"{label}: {port} busy, moved to {host}:{port}", "WARN")
+        log(f"{label}: original port busy, moved to {host}:{port}", "WARN")
     sv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if os.name != "nt":
         sv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -915,9 +1224,32 @@ def start_tcp(port, label, explicit):
         while not STOP.is_set():
             try:
                 cn, ad = sv.accept()
-                threading.Thread(target=_dsp, args=(cn, ad, True), daemon=True).start()
-            except OSError:
+            except Exception:
                 time.sleep(0.2)
+                continue
+            try:
+                if not _CONN_SEM.acquire(blocking=False):
+                    try:
+                        cn.close()
+                    except OSError:
+                        pass
+                    continue
+
+                def _run(c):
+                    try:
+                        _dsp(c, ad, True)
+                    finally:
+                        _CONN_SEM.release()
+                _POOL.submit(_run, cn)
+            except Exception:
+                try:
+                    _CONN_SEM.release()
+                except ValueError:
+                    pass
+                try:
+                    cn.close()
+                except OSError:
+                    pass
     threading.Thread(target=loop, daemon=True).start()
     log(f"{label}: listening {host}:{port} ({'set' if explicit else 'auto'})")
     return port
@@ -935,8 +1267,18 @@ def api():
 
 
 def web(cn, path):
-    po = path.split("?", 1)[0]
+    po, _, qs = path.partition("?")
+    query = {}
+    if qs:
+        for pair in qs.split("&"):
+            if not pair:
+                continue
+            k, _, v = pair.partition("=")
+            query[urllib.parse.unquote_plus(k)] = urllib.parse.unquote_plus(v)
     if po == SUB_PATH or (po.rstrip("/") == SUB_PATH.rstrip("/") and SUB_PATH != "/"):
+        if _SUB_TOKEN and not _tok_ok(query.get("token"), _SUB_TOKEN):
+            h_snd(cn, 404, b"Not Found", "text/plain; charset=utf-8")
+            return
         blob = STATE.get("links") or b""
         if not blob:
             h_snd(cn, 503, b"preparing", "text/plain; charset=utf-8")
@@ -949,6 +1291,9 @@ def web(cn, path):
                                    "aux": STATE["aux"]}).encode(), "application/json; charset=utf-8")
         return
     if po == API_PATH:
+        if _API_TOKEN and not _tok_ok(query.get("token"), _API_TOKEN):
+            h_snd(cn, 404, b"Not Found", "text/plain; charset=utf-8")
+            return
         h_snd(cn, 200, json.dumps(api()).encode(), "application/json; charset=utf-8")
         return
     h_snd(cn, 200 if po in ("/", "/index.html") else 404,
@@ -959,6 +1304,10 @@ def stop(sig=None, frame=None):
     if STOP.is_set():
         return
     STOP.set()
+    try:
+        _POOL.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     log("stopping", "WARN")
     with LOCK:
         kids = list(KIDS)
@@ -983,17 +1332,22 @@ def stop(sig=None, frame=None):
 
 
 def cleaner():
+    delay = Ci("CLEAN_DELAY", 300)
     while not STOP.is_set():
         try:
             if WORK and WORK.exists():
+                now = time.time()
                 for p in WORK.glob("*.t"):
                     try:
+                        # 在途下载每写一块 mtime 就刷新，600 秒门槛把抢删这条路封掉
+                        if now - p.stat().st_mtime < 600:
+                            continue
                         p.unlink()
                     except OSError:
-                        pass
+                        continue
         except Exception:
             pass
-        if STOP.wait(300):
+        if STOP.wait(delay):
             break
 
 
@@ -1011,6 +1365,7 @@ def banner():
 
 
 def prepare():
+    _tune_kernel_udp()
     if CFG["core_on"]:
         ensure_cert()
     stale = _prune()
@@ -1032,7 +1387,7 @@ def prepare():
     threading.Thread(target=cleaner, daemon=True).start()
 
 
-# Site defaults: set values here. Environment variables take precedence over these.
+# Site defaults: 这里填的值优先级低于同名环境变量。
 DEFAULTS = {
     "UID": "",
     "DOMAIN": "www.bing.com",
@@ -1048,12 +1403,55 @@ DEFAULTS = {
     "WORK_DIR": "",
     "BIND_HOST": "",
     "PUBLIC_PORT": "",
-    "CLEAN_DELAY": "",
+    "CLEAN_DELAY": "300",
+    "SOCKS_AUTH": "1",
+    "UDP_ENABLE": "1",
+    "MAX_CONN": "512",
+    "PP_BUF_HIGH": "524288",
+    "PP_IDLE_TIMEOUT": "0",
+    "DNS_TTL": "300",
+    "DNS_CACHE": "1",
+    "QUIC_IDLE": "60s",
+    "UDP_IDLE": "60s",
+    "HY2_MODE": "",
+    "BANDWIDTH_UP": "",
+    "BANDWIDTH_DOWN": "",
+    "MASQ_TYPE": "proxy",
+    "MASQ_URL": "https://www.bing.com/",
+    "SUB_TOKEN": "",
+    "API_TOKEN": "",
 }
 
 
 def _defaults():
     HARD.update({k: str(v) for k, v in DEFAULTS.items()})
+
+
+def _apply_runtime():
+    """把 DEFAULTS / 环境变量统一刷进那几个模块级对象。
+
+    文件顶部的模块级初始化跑在 _defaults() 之前，直读 os.environ，
+    所以只改文件底部 DEFAULTS 时那边是看不到的，必须在这里再刷一遍。
+    """
+    global AUTH, _SUB_TOKEN, _API_TOKEN, _MAX_W, _BUF_HIGH
+    global _DNS_TTL, _DNS_CACHE_ON, _CONN_SEM, _POOL
+    AUTH = Ci("SOCKS_AUTH", 1) == 1
+    _SUB_TOKEN = C("SUB_TOKEN").strip()
+    _API_TOKEN = (C("API_TOKEN") or _SUB_TOKEN).strip()
+    _MAX_W = max(32, Ci("MAX_CONN", 128))
+    _BUF_HIGH = max(262144, Ci("PP_BUF_HIGH", 1048576))
+    try:
+        _DNS_TTL = max(1.0, float(C("DNS_TTL") or "300"))
+    except ValueError:
+        _DNS_TTL = 300.0
+    _DNS_CACHE_ON = C("DNS_CACHE") != "0"
+    _CONN_SEM = threading.BoundedSemaphore(_MAX_W)
+    if getattr(_POOL, "_max_workers", None) != _MAX_W:
+        try:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        _POOL = _cf.ThreadPoolExecutor(max_workers=_MAX_W, thread_name_prefix="proxy")
 
 
 def _osrelease():
@@ -1079,13 +1477,20 @@ def _sysinfo():
 def _prune(max_age=604800):
     now = time.time()
     gone = 0
+    keep = {PEM_NAME, KEY_NAME, MAP_NAME, RES_NAME, PORT_NAME, "kmsg", "dmesg"}
+    for k in ("cert", "key", "cfg"):
+        fp = CFG.get(k)
+        if fp:
+            keep.add(Path(fp).name)
     try:
         entries = list(WORK.iterdir())
     except OSError:
         return 0
     for fp in entries:
         try:
-            if not fp.is_file() or now - fp.stat().st_mtime <= max_age:
+            if not fp.is_file() or fp.name in keep:
+                continue
+            if now - fp.stat().st_mtime <= max_age:
                 continue
             fp.unlink()
             gone += 1
@@ -1096,15 +1501,20 @@ def _prune(max_age=604800):
 
 def _selftest():
     _defaults()
+    _apply_runtime()
     probe = Path(tempfile.gettempdir()) / (FSDIR + "-selftest")
     ok_dir = _try_dir(probe)
+    exec_ok = bool(ok_dir) and not _noexec(probe)
     if ok_dir:
         shutil.rmtree(probe, ignore_errors=True)
     checks = (("defaults", len(HARD) >= 15),
               ("endpoints", CORE_URLS["x64"].startswith(_A) and CORE_URLS["arm64"].endswith("arm")),
               ("pem", _FALLBACK_PEM.count("BEGIN CERTIFICATE") == 2 and len(_FALLBACK_PEM) > 900),
               ("ports", ok_port("8080") and not ok_port("70000")),
-              ("workdir", ok_dir))
+              ("workdir", ok_dir),
+              ("execmount", exec_ok),
+              ("bufcap", _BUF_HIGH >= 262144 and _MAX_W >= 32),
+              ("ready", callable(globals().get("start_tcp")) and callable(globals().get("_pp"))))
     bad = 0
     for name, good in checks:
         log(f"check {name}: {'ok' if good else 'failed'}", "INFO" if good else "ERROR")
@@ -1134,6 +1544,7 @@ def main():
     if _cli():
         raise SystemExit(_selftest())
     _defaults()
+    _apply_runtime()
     for s in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(s, stop)
@@ -1158,8 +1569,16 @@ def main():
         log("core disabled: arch or port or uid missing", "WARN")
     if not CFG["aux_on"]:
         log("aux disabled: url or token missing", "WARN")
+    log(f"runtime: auth={AUTH} conn={_MAX_W} buf={_BUF_HIGH} dns_ttl={_DNS_TTL:.0f} "
+        f"dns_cache={_DNS_CACHE_ON} sub_token={'set' if _SUB_TOKEN else 'off'}")
+    want = sport
     sport = start_tcp(sport, "proxy", s_set)
-    CFG["sport"] = sport or sport
+    if sport:
+        CFG["sport"] = sport
+        if sport != CFG["pub_sport"] and not (pub and want == pub):
+            # 端口漂移之后订阅要跟着改，否则客户端拿到的端口指向空气
+            CFG["pub_sport"] = sport
+            log(f"publish port resync: tcp {sport}", "WARN")
     log(f"app up: tcp {CFG['sport']} ({src}) work {WORK}")
     threading.Thread(target=prepare, daemon=True).start()
     try:
