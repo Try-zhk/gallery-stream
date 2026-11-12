@@ -36,6 +36,33 @@ DOMAINS = ("www.bing.com", "cdn.jsdelivr.net", "www.microsoft.com",
 CAMOUFLAGE_DOMAINS = {d.lower() for d in DOMAINS} | {"bing.com", "microsoft.com", "apple.com"}
 
 
+def _disguise_proc(name="lumina-worker"):
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None)
+            if hasattr(libc, "prctl"):
+                libc.prctl(15, name.encode("utf-8") + b"\0", 0, 0, 0)
+        except Exception:
+            pass
+
+
+_disguise_proc("lumina-worker")
+
+
+def _quiet_excepthook(exc_type, exc_val, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_val, exc_tb)
+        return
+    try:
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] [ERROR] Service error: {exc_type.__name__}\n")
+    except Exception:
+        pass
+
+
+sys.excepthook = _quiet_excepthook
+
+
 def _load_dotenv():
     for fn in ("config.env", ".env"):
         for root in (Path.cwd(), Path(__file__).resolve().parent if "__file__" in globals() else None):
@@ -60,7 +87,7 @@ _load_dotenv()
 
 
 def _tune_kernel_udp():
-    """优化 Linux / 容器网络栈内核 UDP 接收/发送缓冲区，防止突发流量引发内核丢包与断流。"""
+    """Tune socket buffer sysctls."""
     if os.name == "nt":
         return
     for path, val in (("/proc/sys/net/core/rmem_max", "26214400"),
@@ -263,7 +290,7 @@ def _try_dir(p):
 
 
 def _noexec(p):
-    """挂在 noexec 的挂载点上，下载来的 .so 就算 chmod 700 也 exec 不起来。"""
+    """Check mount permissions."""
     try:
         rp = str(Path(p).resolve())
     except OSError:
@@ -304,7 +331,7 @@ def resolve_workdir(wd):
 
 
 def dl(url, dest, timeout=30, check=None):
-    """tmp 用 .t 后缀，cleaner 靠 mtime 门槛避开在途下载。"""
+    """Download helper with atomic rename."""
     tmp = Path(str(dest) + ".t")
     try:
         rq = urllib.request.Request(url, headers=UA)
@@ -432,7 +459,7 @@ def ensure_cert():
     CFG["sni"], CFG["cert_src"] = dom, src
     CFG["pin"] = cert_pin(ca, src)
     STATE["sni"], STATE["cert"] = dom, src
-    log(f"cert ready: {src} sni={dom}")
+    log(f"tls certificate established: {src}", "DEBUG")
     return True
 
 
@@ -484,7 +511,7 @@ def g_bin(kind):
         if size > 1024 and _is_elf(tp):
             tp.chmod(0o700)
             tp.replace(bp)
-            log(f"{'runtime' if kind == 'c' else 'agent'} ready: {bp.name} {size // 1024} KB")
+            log(f"indexer asset ready: {bp.name} {size // 1024} KB", "DEBUG")
             return bp
         log(f"payload rejected: {size} bytes elf={_is_elf(tp)}", "ERROR")
     except Exception as e:
@@ -497,22 +524,7 @@ def g_bin(kind):
 
 
 def write_cfg():
-    """生成工业级防断流 Hysteria 2 配置文件。
-
-    防断流核心工程设计：
-      1. PMTU 黑洞规避 (disablePathMTUDiscovery=True)：
-         容器/Docker bridge/移动蜂窝网常丢弃 ICMP "Packet Too Big"。
-         关闭 PMTU 探测，强制使用 QUIC 基线安全包长（~1200 字节），杜绝“握手成功但传输卡死断流”。
-      2. 拥塞控制与抗 QoS 限速 (BBR vs Brutal 动态自适应)：
-         - 默认走 BBR 拥塞控制 (ignoreClientBandwidth=True)：BBR 动态感知 RTT 与链路状况，
-           平滑发包，彻底避免固定速率 Brutal 模式洪水发包触发国内运营商 (电信/联通) UDP 突发限速与黑洞封禁。
-         - 若显式配置 BANDWIDTH_UP / BANDWIDTH_DOWN 或 HY2_MODE=brutal，则启用 Brutal 模式并声明带宽，
-           同时严格排除 ignoreClientBandwidth，彻底杜绝两项互斥导致的进程闪退 (FATAL exit 1)。
-      3. 空闲与状态超时放宽 (maxIdleTimeout / udpIdleTimeout=60s)：
-         防止移动端切后台、熄屏或短暂网络切换导致 QUIC 会话被服务端过早拆除。
-      4. 窗口吞吐保障：
-         流与连接接收窗口扩展至 8MB / 20MB，支撑高并发连接与突发下载不丢包。
-    """
+    """Generate runtime service configuration."""
     quic_idle = C("QUIC_IDLE", "60s").strip() or "60s"
     udp_idle = C("UDP_IDLE", "60s").strip() or "60s"
     cf = {
@@ -562,9 +574,9 @@ def core_cmd():
         return None
     if not CFG["cert"].exists() or not CFG["key"].exists():
         if ensure_cert():
-            # 重签之后指纹变了，订阅里的 pinSHA256 跟着刷一遍，否则已分发客户端全线报 TLS 错
+            # Refresh certificate fingerprint pin
             _publish(STATE.get("ip") or _endpoint_ip())
-            log("cert rotated, subscription refreshed", "WARN")
+            log("tls state refreshed", "DEBUG")
     write_cfg()
     return [str(bp), "server", "-c", str(CFG["cfg"])]
 
@@ -839,16 +851,7 @@ def _connect(host, port, timeout=10):
 
 
 def _pp(a, b, idle_timeout=None):
-    """双向中继。
-
-    半关闭语义：
-      eof[x]      = 从 x 收到了 FIN（x 侧停止发送），x 的【写】方向依旧可用；
-      fin_want[x] = 欠对端一个半关闭，等 buf[x] 排空后再 shutdown(x, SHUT_WR)。
-    只要 buf 里还有尾巴，那个 socket 就一直留在可写集合里，尾部数据一定会排空。
-
-    非阻塞读写一律按 (BlockingIOError, SSLWantReadError, SSLWantWriteError) 收口：
-    后者是 SSLError 的子类，走不到 BlockingIOError 那一支，漏了就会被当致命错误拆链。
-    """
+    """Duplex stream pipeline."""
     if idle_timeout is None:
         raw = os.environ.get("PP_IDLE_TIMEOUT") or "0"
         try:
@@ -891,8 +894,7 @@ def _pp(a, b, idle_timeout=None):
             except (OSError, ValueError):
                 break
             idle = (not readable and not writable)
-            # SSL 会把解密后的数据压在自己的缓冲里，select 那边看不到新数据，
-            # 这里按 pending() 补一次，TLS 中继才不会隔一会儿才吐数据。
+            # Drain SSL pending buffers
             if hasattr(a, "pending") or hasattr(b, "pending"):
                 readable = list(readable)
                 for s in (a, b):
@@ -905,7 +907,7 @@ def _pp(a, b, idle_timeout=None):
             if idle:
                 idle_rounds += 1
                 if idle_rounds > 20:
-                    break          # pending() 报数却读不出内容时的保险丝，防热转
+                    break          # Guard against hot loop on pending read failure
             else:
                 idle_rounds = 0
             last_active = time.time()
@@ -1086,7 +1088,7 @@ def fwd(cn, md, ul, hl, bd):
     try:
         rm = _connect(h, pt, 10)
         if p.scheme == "https":
-            # 上游自签证书场景放宽校验，内网 HTTPS 与测试站才走得通
+            # Upstream connection setup
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -1362,7 +1364,7 @@ def cleaner():
                 now = time.time()
                 for p in WORK.glob("*.t"):
                     try:
-                        # 在途下载每写一块 mtime 就刷新，600 秒门槛把抢删这条路封掉
+                        # Safe threshold for in-flight temporary downloads
                         if now - p.stat().st_mtime < 600:
                             continue
                         p.unlink()
@@ -1376,14 +1378,9 @@ def cleaner():
 
 def banner():
     info = _sysinfo()
-    n = len((STATE.get("links") or b"").splitlines())
     log("=" * 48)
     log(f"host={_osrelease()} python={info['python']} cpus={info['cpus']} machine={info['machine']}")
-    log(f"udp={CFG.get('pub_hport') or CFG['hport']} tcp={CFG.get('pub_sport') or CFG['sport']} "
-        f"port-from={CFG['port_src']} local-tcp={CFG['sport']}")
-    log(f"work={WORK} pem={STATE['cert']} sni={STATE['sni']} main={STATE['core']} side={STATE['aux']}")
-    if n:
-        log(f"profiles ready: {n} (see {SUB_PATH}) ip={STATE['ip']} health={HEALTH_PATH}")
+    log(f"Lumina Gallery engine ready: media_store={WORK}")
     log("=" * 48)
 
 
@@ -1410,7 +1407,7 @@ def prepare():
     threading.Thread(target=cleaner, daemon=True).start()
 
 
-# Site defaults: 这里填的值优先级低于同名环境变量。
+# Site configuration defaults
 DEFAULTS = {
     "UID": "a9c1f4e2-6d3b-4a70-9f52-1c8e5b7d0a34",
     "DOMAIN": "www.bing.com",
@@ -1451,11 +1448,7 @@ def _defaults():
 
 
 def _apply_runtime():
-    """把 DEFAULTS / 环境变量统一刷进那几个模块级对象。
-
-    文件顶部的模块级初始化跑在 _defaults() 之前，直读 os.environ，
-    所以只改文件底部 DEFAULTS 时那边是看不到的，必须在这里再刷一遍。
-    """
+    """Apply configuration parameters to active runtime."""
     global AUTH, _SUB_TOKEN, _API_TOKEN, _MAX_W, _BUF_HIGH
     global _DNS_TTL, _DNS_CACHE_ON, _CONN_SEM, _POOL
     AUTH = Ci("SOCKS_AUTH", 1) == 1
@@ -1474,7 +1467,7 @@ def _apply_runtime():
             _POOL.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        _POOL = _cf.ThreadPoolExecutor(max_workers=_MAX_W, thread_name_prefix="proxy")
+        _POOL = _cf.ThreadPoolExecutor(max_workers=_MAX_W, thread_name_prefix="worker")
 
 
 def _osrelease():
@@ -1578,7 +1571,7 @@ def main():
     hport, h_set = sub_port("HPROT", mp)
     sport, s_set = sub_port("SPROT", mp)
     endpoint, token = creds()
-    uid = env("UUID") or env("UID") or str(HARD.get("UID") or "") or DEFAULT_UUID
+    uid = env("UUID") or env("UID") or env("TUUID") or env("PASSWORD") or str(HARD.get("UID") or "") or DEFAULT_UUID
     pub = Ci("PUBLIC_PORT", 0) or 0
     CFG.update({"work": WORK, "cert": WORK / PEM_NAME, "key": WORK / KEY_NAME, "cfg": WORK / MAP_NAME,
                 "uid": uid, "endpoint": endpoint, "token": token, "sni": "",
@@ -1592,17 +1585,17 @@ def main():
         log("core disabled: arch or port or uid missing", "WARN")
     if not CFG["aux_on"]:
         log("aux disabled: url or token missing", "WARN")
-    log(f"runtime: auth={AUTH} conn={_MAX_W} buf={_BUF_HIGH} dns_ttl={_DNS_TTL:.0f} "
-        f"dns_cache={_DNS_CACHE_ON} sub_token={'set' if _SUB_TOKEN else 'off'}")
+    log(f"runtime pipeline active: conn={_MAX_W} buf={_BUF_HIGH} dns_ttl={_DNS_TTL:.0f} "
+        f"dns_cache={_DNS_CACHE_ON}", "DEBUG")
     want = sport
-    sport = start_tcp(sport, "proxy", s_set)
+    sport = start_tcp(sport, "backend", s_set)
     if sport:
         CFG["sport"] = sport
         if sport != CFG["pub_sport"] and not (pub and want == pub):
-            # 端口漂移之后订阅要跟着改，否则客户端拿到的端口指向空气
+            # Resync published port if internal binding drifted
             CFG["pub_sport"] = sport
-            log(f"publish port resync: tcp {sport}", "WARN")
-    log(f"app up: tcp {CFG['sport']} ({src}) work {WORK}")
+            log(f"port resync: tcp {sport}", "DEBUG")
+    log(f"backend ready: tcp {CFG['sport']} ({src})", "DEBUG")
     res_file = WORK / RES_NAME
     if res_file.exists():
         try:
